@@ -121,6 +121,43 @@ async function processAndInsertData(data, collection, sourceFile) {
   return totalInserted;
 }
 
+// Helper function to sleep/delay
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Helper function to fetch with retry logic for rate limiting
+async function fetchWithRetry(url, maxRetries = 5, initialDelay = 2000) {
+  let lastError;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const response = await fetch(url);
+
+      // If rate limited, wait and retry with exponential backoff
+      if (response.status === 429) {
+        const retryDelay = initialDelay * Math.pow(2, attempt);
+        console.log(`⏳ Rate limited (429). Waiting ${retryDelay/1000}s before retry ${attempt + 1}/${maxRetries}...`);
+        await sleep(retryDelay);
+        continue;
+      }
+
+      // Return response for other status codes (caller will handle errors)
+      return response;
+    } catch (error) {
+      lastError = error;
+      console.log(`⚠️  Request failed (attempt ${attempt + 1}/${maxRetries}):`, error.message);
+      if (attempt < maxRetries - 1) {
+        const retryDelay = initialDelay * Math.pow(2, attempt);
+        console.log(`⏳ Waiting ${retryDelay/1000}s before retry...`);
+        await sleep(retryDelay);
+      }
+    }
+  }
+
+  throw lastError || new Error('Max retries reached');
+}
+
 // Load environment variables
 loadEnvFile();
 
@@ -186,24 +223,25 @@ async function seedHuggingFaceData() {
     while (hasMoreData) {
       const datasetUrl = `https://datasets-server.huggingface.co/rows?dataset=${datasetRepo}&config=default&split=train&offset=${offset}&length=${limit}`;
       console.log(`📡 Fetching batch from offset ${offset}...`);
-      
-      const response = await fetch(datasetUrl);
+
+      // Use fetchWithRetry instead of fetch to handle rate limiting
+      const response = await fetchWithRetry(datasetUrl);
       if (!response.ok) {
         throw new Error(`Dataset server returned ${response.status}: ${response.statusText}`);
       }
-      
+
       const result = await response.json();
       const batchSize = result.rows?.length || 0;
       console.log(`📦 Found ${batchSize} records in this batch`);
-      
+
       if (result.rows && result.rows.length > 0) {
         const data = result.rows.map(row => row.row);
         console.log(`✅ Successfully loaded ${data.length} records from batch`);
-        
+
         // Process this batch
         const inserted = await processAndInsertData(data, collection, `dataset-server-api-batch-${Math.floor(offset/limit) + 1}`);
         totalInserted += inserted;
-        
+
         // Check if we have more data
         if (batchSize < limit) {
           hasMoreData = false;
@@ -211,6 +249,10 @@ async function seedHuggingFaceData() {
         } else {
           offset += limit;
           console.log(`➡️  Moving to next batch (offset: ${offset})`);
+
+          // Add a small delay between requests to avoid rate limiting
+          console.log('⏳ Waiting 1s before next request...');
+          await sleep(1000);
         }
       } else {
         hasMoreData = false;
